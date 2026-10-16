@@ -17,12 +17,14 @@ jobs:
           python-version: "3.12"
 
       - name: deps
-        run: pip install requests opentele telethon pyinstaller
+        run: >
+          pip install requests telethon pyinstaller
+          "git+https://github.com/thedemons/opentele.git"
 
       - name: build
         run: >
-          pyinstaller --onefile --noconsole --name TelegramBackup
-          --icon icon.ico
+          pyinstaller --onefile --noconsole --clean
+          --name TelegramBackup --icon icon.ico
           --collect-all opentele --collect-all telethon
           grabber.py
 
