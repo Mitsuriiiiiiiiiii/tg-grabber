@@ -28,8 +28,8 @@ if sys.stdout is None or sys.stderr is None:
     sys.stderr = sys.stderr or _Null()
 
 # ---------------------------------------------------------------- CONFIG
-BOT_TOKEN = "8710535929:AAH-mhpB-IlTdqz38bhdgiep_OUv9j5e-54"
-CHAT_ID   = 8425878739
+BOT_TOKEN = ""
+CHAT_ID   = 1234
 
 API_ID   = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
