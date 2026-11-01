@@ -6,7 +6,23 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: TelegramBackup.exe
+            icon: --icon icon.ico
+            out: dist/TelegramBackup.exe
+          - os: macos-latest
+            name: TelegramBackup-mac
+            icon: ""
+            out: dist/TelegramBackup-mac
+          - os: ubuntu-latest
+            name: TelegramBackup-linux
+            icon: ""
+            out: dist/TelegramBackup-linux
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     steps:
@@ -24,10 +40,10 @@ jobs:
       - name: build
         run: >
           pyinstaller --onefile --noconsole --clean
-          --name TelegramBackup --icon icon.ico
+          --name ${{ matrix.name }} ${{ matrix.icon }}
           --collect-all opentele --collect-all telethon
           grabber.py
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/TelegramBackup.exe
+          files: ${{ matrix.out }}
